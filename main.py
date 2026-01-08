@@ -645,10 +645,12 @@ class RARLAgent(BaseAgent):
     Retrieval trigger: high policy entropy.
     """
 
-    def __init__(self, obs_dim: int, act_dim: int, cfg: dict, embedder: SimpleEmbedder, vstore: VectorStore):
+    def __init__(self, obs_dim: int, act_dim: int, cfg: dict, embedder: SimpleEmbedder, vstore: VectorStore, query_embedder: SimpleEmbedder):
         # augmented observation dimension: obs_dim + embed_dim
         self.base_obs_dim = obs_dim
-        self.embedder = embedder
+        self.act_dim = act_dim
+        self.embedder = embedder  # for episode summaries
+        self.query_embedder = query_embedder  # for query vectors (obs or obs+action)
         self.vstore = vstore
         self.embed_dim = cfg["embed_dim"]
         # create trainer with augmented obs dim
@@ -656,24 +658,31 @@ class RARLAgent(BaseAgent):
         self.retrieval_threshold_entropy = cfg["retrieval_threshold_entropy"]
 
     def _should_retrieve(self, obs: np.ndarray):
-        # measure policy entropy on current obs
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        # measure policy entropy on current obs (augmented with zero context for consistency)
+        zero_ctx = np.zeros(self.embed_dim, dtype=np.float32)
+        aug_obs = np.concatenate([obs, zero_ctx])
+        obs_t = torch.tensor(aug_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         # get entropy via a forward pass
         _, _, _, entropy = self.trainer.ac.step(obs_t)
         ent = float(entropy[0])
         return ent > self.retrieval_threshold_entropy
 
     def _form_retrieval_query(self, obs: np.ndarray, last_action: Optional[np.ndarray] = None):
-        # build a numeric context vector (obs + last_action optionally)
+        # build a numeric context vector (obs + last_action)
+        # Always include action dimension, padding with zeros if last_action is None
         if last_action is None:
-            vec = obs
+            action_vec = np.zeros(self.act_dim, dtype=np.float32)
         else:
-            vec = np.concatenate([obs, np.asarray(last_action, dtype=np.float32)])
+            action_vec = np.asarray(last_action, dtype=np.float32).flatten()
+            # Ensure action_vec has the right dimension
+            if len(action_vec) != self.act_dim:
+                action_vec = np.zeros(self.act_dim, dtype=np.float32)
+        vec = np.concatenate([obs, action_vec])
         return vec.reshape(1, -1)
 
     def _retrieve_context(self, obs: np.ndarray, last_action: Optional[np.ndarray] = None):
         q = self._form_retrieval_query(obs, last_action)
-        q_emb = self.embedder.transform(q)  # (1, embed_dim)
+        q_emb = self.query_embedder.transform(q)  # (1, embed_dim)
         vecs, metas = self.vstore.query(q_emb, topk=CONFIG["retrieval_k"])
         if len(vecs) == 0:
             return np.zeros(self.embed_dim, dtype=np.float32)
@@ -691,6 +700,14 @@ class RARLAgent(BaseAgent):
         obs_t = torch.tensor(aug_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         action, logp = self.trainer.ac.act(obs_t)
         return action[0], logp[0], ctx
+
+    def value(self, obs: np.ndarray, last_action: Optional[np.ndarray] = None):
+        # For RARL, we need to augment observation with context (or zero context)
+        # Use zero context for value estimation during training rollouts
+        zero_ctx = np.zeros(self.embed_dim, dtype=np.float32)
+        aug_obs = np.concatenate([obs, zero_ctx])
+        obs_t = torch.tensor(aug_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        return self.trainer.ac.get_value(obs_t)[0]
 
 
 # ---------------------------
@@ -753,11 +770,15 @@ def gather_episodes_for_training(env: MarketEnv, agent: BaseAgent, cfg: dict, us
                 # Instead: use current policy without retrieval (or optionally use retrieval - configurable)
                 # We'll call select_action that returns (action, logp, ctx)
                 a, logp, ctx = agent.select_action(obs, last_action)
+                # For RARL, augment observation with context for storage
+                aug_obs = np.concatenate([obs, ctx])
+                val = agent.value(obs, last_action)
             else:
                 a, logp = agent.select_action(obs)
-            val = agent.value(obs)
+                aug_obs = obs  # no augmentation for baseline
+                val = agent.value(obs)
             obs_next, rew, done, trunc, info = env.step(a)
-            buf.store(obs, a, rew, done, val, logp)
+            buf.store(aug_obs, a, rew, done, val, logp)
             # accumulate episode arrays
             episode_obs.append(obs)
             episode_actions.append(a)
@@ -884,6 +905,7 @@ def run_experiment(cfg: dict, mode: str = "baseline"):
 
     # vector store & embedder for RARL
     embedder = None
+    query_embedder = None
     vstore = None
     if mode == "rarl":
         # choose embedder: sentence-transformer if available, otherwise SimpleEmbedder on numeric summary features
@@ -895,13 +917,17 @@ def run_experiment(cfg: dict, mode: str = "baseline"):
             embedder = SimpleEmbedder(embed_input_dim, cfg["embed_dim"], device=cfg["device"])
         else:
             embedder = SimpleEmbedder(embed_input_dim, cfg["embed_dim"], device=cfg["device"])
+        # Query embedder: accepts obs_dim (or obs_dim + act_dim if last_action is included)
+        # We'll use obs_dim + act_dim to handle both cases
+        query_input_dim = obs_dim + act_dim
+        query_embedder = SimpleEmbedder(query_input_dim, cfg["embed_dim"], device=cfg["device"])
         vstore = VectorStore(embed_dim=cfg["embed_dim"], max_size=cfg["vector_store_max_size"])
 
     # create agents
     if mode == "baseline":
         agent = BaseAgent(obs_dim=obs_dim, act_dim=act_dim, cfg=cfg)
     else:
-        agent = RARLAgent(obs_dim=obs_dim, act_dim=act_dim, cfg=cfg, embedder=embedder, vstore=vstore)
+        agent = RARLAgent(obs_dim=obs_dim, act_dim=act_dim, cfg=cfg, embedder=embedder, vstore=vstore, query_embedder=query_embedder)
 
     # training loop
     print(f"Starting training mode={mode}, device={cfg['device']}")
