@@ -691,7 +691,12 @@ class RARLAgent(BaseAgent):
 
     def _retrieve_context(self, obs: np.ndarray, last_action: Optional[np.ndarray] = None):
         q = self._form_retrieval_query(obs, last_action)
-        q_emb = self.query_embedder.transform(q)  # (1, embed_dim)
+        # Use fit_transform on first call, transform thereafter
+        # Check if scaler is fitted by checking if it has mean_ attribute
+        if not hasattr(self.query_embedder.scaler, 'mean_') or self.query_embedder.scaler.mean_ is None:
+            q_emb = self.query_embedder.fit_transform(q)  # (1, embed_dim)
+        else:
+            q_emb = self.query_embedder.transform(q)  # (1, embed_dim)
         vecs, metas = self.vstore.query(q_emb, topk=CONFIG["retrieval_k"])
         if len(vecs) == 0:
             return np.zeros(self.embed_dim, dtype=np.float32)
