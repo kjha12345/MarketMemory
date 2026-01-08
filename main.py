@@ -303,10 +303,13 @@ class MarketEnv(gym.Env):
         # price normalized by something; keep raw floats
         time_frac = (self.episode_length - self.time) / max(1, self.episode_length)
         capacity_util = 1.0  # placeholder (could track cumulative capacity)
+        # Get current inflation multiplier from active shocks
+        _, inflation_mult, _ = self._apply_shock_effects()
         obs = np.concatenate([
             np.array([self.price, self.base_demand], dtype=np.float32),
             np.array([capacity_util], dtype=np.float32),
             np.array([time_frac], dtype=np.float32),
+            np.array([inflation_mult], dtype=np.float32),  # inflation multiplier
             np.array(list(self.price_history), dtype=np.float32),
         ]).astype(np.float32)
         return obs
@@ -630,11 +633,17 @@ class BaseAgent:
                                   max_grad_norm=cfg["max_grad_norm"])
 
     def select_action(self, obs: np.ndarray):
+        # Verify observation dimension matches expected
+        if len(obs) != self.obs_dim:
+            raise ValueError(f"Observation dimension mismatch: got {len(obs)}, expected {self.obs_dim}")
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         action, logp = self.trainer.ac.act(obs_t)
         return action[0], logp[0]
 
     def value(self, obs: np.ndarray):
+        # Verify observation dimension matches expected
+        if len(obs) != self.obs_dim:
+            raise ValueError(f"Observation dimension mismatch: got {len(obs)}, expected {self.obs_dim}")
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         return self.trainer.ac.get_value(obs_t)[0]
 
@@ -691,21 +700,33 @@ class RARLAgent(BaseAgent):
         return agg.astype(np.float32)
 
     def select_action(self, obs: np.ndarray, last_action: Optional[np.ndarray] = None):
+        # Verify base observation dimension
+        if len(obs) != self.base_obs_dim:
+            raise ValueError(f"Base observation dimension mismatch: got {len(obs)}, expected {self.base_obs_dim}")
         # decide whether to retrieve
         if self._should_retrieve(obs):
             ctx = self._retrieve_context(obs, last_action)
         else:
             ctx = np.zeros(self.embed_dim, dtype=np.float32)
         aug_obs = np.concatenate([obs, ctx])
+        # Verify augmented observation dimension
+        if len(aug_obs) != self.obs_dim:
+            raise ValueError(f"Augmented observation dimension mismatch: got {len(aug_obs)}, expected {self.obs_dim}")
         obs_t = torch.tensor(aug_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         action, logp = self.trainer.ac.act(obs_t)
         return action[0], logp[0], ctx
 
     def value(self, obs: np.ndarray, last_action: Optional[np.ndarray] = None):
+        # Verify base observation dimension
+        if len(obs) != self.base_obs_dim:
+            raise ValueError(f"Base observation dimension mismatch: got {len(obs)}, expected {self.base_obs_dim}")
         # For RARL, we need to augment observation with context (or zero context)
         # Use zero context for value estimation during training rollouts
         zero_ctx = np.zeros(self.embed_dim, dtype=np.float32)
         aug_obs = np.concatenate([obs, zero_ctx])
+        # Verify augmented observation dimension
+        if len(aug_obs) != self.obs_dim:
+            raise ValueError(f"Augmented observation dimension mismatch: got {len(aug_obs)}, expected {self.obs_dim}")
         obs_t = torch.tensor(aug_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         return self.trainer.ac.get_value(obs_t)[0]
 
