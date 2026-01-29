@@ -163,15 +163,25 @@ class RARLAgent:
             similarity = exp["similarity"]
             reward = exp["reward"]
             # Normalize reward to [0, 1] range for weighting
-            reward_norm = max(0, (reward + 50) / 100)  # Assuming rewards in [-50, 50] range
+            # Use a more robust normalization that handles any reward range
+            reward_min, reward_max = -100, 100  # Conservative bounds
+            reward_norm = max(0, min(1, (reward - reward_min) / (reward_max - reward_min)))
             
             weight = similarity * (1 + reward_norm)
             weights.append(weight)
             actions.append(exp["action"])
         
-        # Normalize weights
+        # Normalize weights and handle edge cases
         weights = np.array(weights)
-        weights = weights / (weights.sum() + 1e-8)
+        weights_sum = weights.sum()
+        
+        # If weights sum to zero or are all negative, use uniform weighting
+        if weights_sum <= 1e-8 or np.all(weights <= 0):
+            weights = np.ones_like(weights) / len(weights)
+        else:
+            # Ensure all weights are non-negative
+            weights = np.maximum(weights, 0)
+            weights = weights / weights.sum()
         
         # Weighted average action
         retrieved_action = np.average(actions, weights=weights)

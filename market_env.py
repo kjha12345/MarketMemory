@@ -119,13 +119,34 @@ class MarketEnvironment(gym.Env):
     def _get_state(self) -> np.ndarray:
         """Get current state vector"""
         time_normalized = self.time_step / self.episode_length
-        return np.array([
-            self.demand_level,
-            self.cost,
-            time_normalized,
-            self.supply_available,
-            self.current_price
+        
+        # Clip state values to observation space bounds to prevent overflow
+        demand_clipped = np.clip(self.demand_level, 0.0, 10.0)
+        cost_clipped = np.clip(self.cost, 0.0, 20.0)
+        time_clipped = np.clip(time_normalized, 0.0, 1.0)
+        supply_clipped = np.clip(self.supply_available, 0.0, self.supply_capacity)
+        price_clipped = np.clip(self.current_price, self.min_price, self.max_price)
+        
+        state = np.array([
+            demand_clipped,
+            cost_clipped,
+            time_clipped,
+            supply_clipped,
+            price_clipped
         ], dtype=np.float32)
+        
+        # Additional check for NaN or Inf values
+        if np.any(~np.isfinite(state)):
+            # Replace NaN/Inf with safe defaults
+            state = np.nan_to_num(state, nan=0.0, posinf=10.0, neginf=0.0)
+            # Re-clip after NaN replacement
+            state[0] = np.clip(state[0], 0.0, 10.0)
+            state[1] = np.clip(state[1], 0.0, 20.0)
+            state[2] = np.clip(state[2], 0.0, 1.0)
+            state[3] = np.clip(state[3], 0.0, self.supply_capacity)
+            state[4] = np.clip(state[4], self.min_price, self.max_price)
+        
+        return state
     
     def _apply_market_shock(self, shock_type: MarketRegime):
         """Apply a market shock based on type"""
@@ -134,20 +155,33 @@ class MarketEnvironment(gym.Env):
         if shock_type == MarketRegime.DEMAND_SPIKE:
             # Sudden increase in willingness to pay
             self.demand_level = self.base_demand * (1 + self.shock_magnitude * 2)
+            # Clip to observation space bounds
+            self.demand_level = np.clip(self.demand_level, 0.0, 10.0)
         
         elif shock_type == MarketRegime.DEMAND_CRASH:
             # Sudden decrease in willingness to pay
             self.demand_level = self.base_demand * (1 - self.shock_magnitude)
+            # Clip to observation space bounds
+            self.demand_level = np.clip(self.demand_level, 0.0, 10.0)
         
         elif shock_type == MarketRegime.SUPPLY_SHOCK:
             # Production costs increase
             self.cost = self.base_cost * (1 + self.shock_magnitude)
             self.supply_available = self.supply_capacity * (1 - self.shock_magnitude * 0.5)
+            # Clip to observation space bounds
+            self.cost = np.clip(self.cost, 0.0, 20.0)
+            self.supply_available = np.clip(self.supply_available, 0.0, self.supply_capacity)
         
         elif shock_type == MarketRegime.POLICY_CHANGE:
             # Policy restricts pricing range
-            self.max_price = min(self.max_price * 0.8, self.max_price - 5)
-            self.min_price = max(self.min_price * 1.2, self.min_price + 2)
+            new_max_price = min(self.max_price * 0.8, self.max_price - 5)
+            new_min_price = max(self.min_price * 1.2, self.min_price + 2)
+            # Ensure min < max and both are within reasonable bounds
+            if new_min_price < new_max_price:
+                self.max_price = np.clip(new_max_price, 1.0, 50.0)
+                self.min_price = np.clip(new_min_price, 1.0, self.max_price)
+            # Also clip current price to new range
+            self.current_price = np.clip(self.current_price, self.min_price, self.max_price)
     
     def _recover_from_shock(self):
         """Gradually recover from shock towards normal conditions"""
@@ -159,6 +193,11 @@ class MarketEnvironment(gym.Env):
             self.cost = self.cost * (1 - recovery_rate) + self.base_cost * recovery_rate
             self.supply_available = self.supply_available * (1 - recovery_rate) + self.supply_capacity * recovery_rate
             
+            # Clip to observation space bounds to prevent overflow
+            self.demand_level = np.clip(self.demand_level, 0.0, 10.0)
+            self.cost = np.clip(self.cost, 0.0, 20.0)
+            self.supply_available = np.clip(self.supply_available, 0.0, self.supply_capacity)
+            
             # Check if recovered
             if (abs(self.demand_level - self.base_demand) < 0.1 and
                 abs(self.cost - self.base_cost) < 0.1):
@@ -169,13 +208,34 @@ class MarketEnvironment(gym.Env):
         Calculate demand based on price using price elasticity.
         Higher price = lower demand (negative elasticity)
         """
+        # Ensure price is positive and within bounds
+        price = max(0.01, min(price, self.max_price))
+        avg_price = (self.min_price + self.max_price) / 2
+        avg_price = max(0.01, avg_price)  # Prevent division by zero
+        
         # Base demand adjusted by price elasticity
-        price_ratio = price / ((self.min_price + self.max_price) / 2)
-        demand = self.demand_level * (price_ratio ** self.price_elasticity)
+        price_ratio = price / avg_price
+        # Clip price_ratio to prevent extreme values
+        price_ratio = np.clip(price_ratio, 0.01, 100.0)
+        
+        # Calculate demand with elasticity
+        try:
+            demand = self.demand_level * (price_ratio ** self.price_elasticity)
+        except (OverflowError, ValueError):
+            # Fallback for extreme values
+            if price_ratio > 1:
+                demand = self.demand_level / (price_ratio ** abs(self.price_elasticity))
+            else:
+                demand = self.demand_level * (price_ratio ** abs(self.price_elasticity))
         
         # Add some noise to make it more realistic
         noise = self.rng.normal(1.0, 0.1)
+        noise = np.clip(noise, 0.1, 2.0)  # Clip noise to prevent extreme values
         demand = max(0, demand * noise)
+        
+        # Ensure demand is finite
+        if not np.isfinite(demand):
+            demand = 0.0
         
         return demand
     
@@ -211,11 +271,19 @@ class MarketEnvironment(gym.Env):
         
         # Sales are limited by supply
         sales = min(demand, self.supply_available)
+        sales = max(0, sales)  # Ensure non-negative
         
-        # Calculate profit
+        # Calculate profit with safeguards
         revenue = price * sales
         variable_costs = self.cost * sales
         profit = revenue - variable_costs - self.fixed_costs
+        
+        # Ensure profit is finite
+        if not np.isfinite(profit):
+            profit = -self.fixed_costs  # Fallback to worst case
+        
+        # Clip profit to reasonable range to prevent extreme values
+        profit = np.clip(profit, -1000.0, 10000.0)
         
         # Update supply (replenish each step)
         self.supply_available = self.supply_capacity
