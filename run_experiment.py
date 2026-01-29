@@ -55,7 +55,6 @@ def main():
         "price_elasticity": -2.0,
         "shock_probability": 0.1,  # 10% chance of shock per timestep
         "shock_magnitude": 0.5,  # 50% magnitude change
-        "seed": args.seed
     }
     
     # RL agent configuration
